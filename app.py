@@ -38,6 +38,7 @@ Set ANTHROPIC_API_KEY in that app's Settings -> Secrets instead of committing .e
 
 import os
 import streamlit as st
+import anthropic
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
@@ -54,6 +55,15 @@ PRICE_PER_MTOK = {
     STRONG_MODEL: {"input": 3.00, "output": 15.00},
 }
 
+# Single shared ceiling for every API call in the app (planner, each specialist, audit) —
+# raise this one constant, not individual call sites, if a response still truncates.
+MAX_TOKENS = 4096
+
+TRUNCATION_WARNING = (
+    "\n\n⚠️ **This response was cut off (hit the model's output limit) — consider a "
+    "shorter goal or a smaller event.**"
+)
+
 
 def get_client() -> Anthropic:
     api_key = os.environ.get("ANTHROPIC_API_KEY") or st.secrets.get("ANTHROPIC_API_KEY", "")
@@ -65,17 +75,64 @@ def get_client() -> Anthropic:
         st.stop()
     # accept-encoding: gzip works around a brotli-decompression bug some environments hit
     # with the default client — same fix used in Halal Scout, carried over here.
-    return Anthropic(api_key=api_key, default_headers={"accept-encoding": "gzip"})
+    # timeout/max_retries are explicit (not just relying on the SDK defaults) so a hung
+    # request fails in ~60s instead of the SDK's 10-minute default read timeout.
+    return Anthropic(
+        api_key=api_key,
+        default_headers={"accept-encoding": "gzip"},
+        timeout=60.0,
+        max_retries=2,
+    )
 
 
-def call_model(client: Anthropic, model: str, system: str, user: str) -> tuple[str, dict]:
-    resp = client.messages.create(
-        model=model,
-        max_tokens=1024,
-        system=system,
-        messages=[{"role": "user", "content": user}],
+class AgentCallError(Exception):
+    """A clean, user-facing message for a failed Anthropic API call — raised once the
+    SDK's own retries (rate limits / 5xx / 529 overloaded) are exhausted, or immediately
+    for a non-retryable failure like a bad API key. Never contains a raw traceback."""
+
+
+def _clean_api_error(exc: Exception, step_label: str) -> AgentCallError:
+    if isinstance(exc, anthropic.AuthenticationError):
+        return AgentCallError(
+            f"{step_label} failed: the Anthropic API key was rejected. "
+            "Check ANTHROPIC_API_KEY and try again."
+        )
+    if isinstance(exc, anthropic.PermissionDeniedError):
+        return AgentCallError(f"{step_label} failed: this API key doesn't have permission for this request.")
+    if isinstance(exc, anthropic.APIConnectionError):
+        return AgentCallError(
+            f"{step_label} failed: couldn't reach the Anthropic API (network issue or timeout). "
+            "Check your connection and try again."
+        )
+    if isinstance(exc, anthropic.APIStatusError):
+        return AgentCallError(
+            f"{step_label} failed: the Anthropic API returned an error ({exc.status_code}). "
+            "Try again in a moment."
+        )
+    return AgentCallError(f"{step_label} failed unexpectedly ({type(exc).__name__}). Try again in a moment.")
+
+
+def create_message(client: Anthropic, step_label: str, **kwargs):
+    """The one choke point every Anthropic API call in the app goes through: applies the
+    shared MAX_TOKENS ceiling, converts SDK errors into a clean AgentCallError (see
+    _clean_api_error), and reports whether the response was truncated (stop_reason ==
+    "max_tokens") so callers can warn instead of silently treating cut-off text as
+    complete."""
+    kwargs.setdefault("max_tokens", MAX_TOKENS)
+    try:
+        resp = client.messages.create(**kwargs)
+    except anthropic.AnthropicError as exc:
+        raise _clean_api_error(exc, step_label) from exc
+    return resp, resp.stop_reason == "max_tokens"
+
+
+def call_model(client: Anthropic, model: str, system: str, user: str, step_label: str = "Agent call") -> tuple[str, dict]:
+    resp, truncated = create_message(
+        client, step_label, model=model, system=system, messages=[{"role": "user", "content": user}]
     )
     text = "".join(b.text for b in resp.content if b.type == "text")
+    if truncated:
+        text += TRUNCATION_WARNING
     usage = {"input_tokens": resp.usage.input_tokens, "output_tokens": resp.usage.output_tokens, "model": model}
     return text, usage
 
@@ -181,17 +238,27 @@ STEP_LABELS = {
 
 
 def execute_tool(client: Anthropic, name: str, tool_input: dict) -> tuple[str, dict]:
+    def require(field: str) -> str:
+        value = tool_input.get(field)
+        if value is None:
+            raise AgentCallError(f"{name} was called without the required '{field}' field — can't proceed.")
+        return value
+
     if name == "run_event_agent":
-        return call_model(client, CHEAP_MODEL, EVENT_AGENT_SYSTEM, tool_input["event_goal"])
+        return call_model(
+            client, CHEAP_MODEL, EVENT_AGENT_SYSTEM, require("event_goal"), step_label="Event/logistics agent"
+        )
     if name == "run_volunteer_agent":
         user_msg = (
-            f"Roles/shifts needed:\n{tool_input['tasks_needed']}\n\n"
-            f"Available volunteers:\n{tool_input['volunteer_roster']}"
+            f"Roles/shifts needed:\n{require('tasks_needed')}\n\n"
+            f"Available volunteers:\n{require('volunteer_roster')}"
         )
-        return call_model(client, CHEAP_MODEL, VOLUNTEER_AGENT_SYSTEM, user_msg)
+        return call_model(client, CHEAP_MODEL, VOLUNTEER_AGENT_SYSTEM, user_msg, step_label="Volunteer coordinator agent")
     if name == "run_comms_agent":
-        return call_model(client, CHEAP_MODEL, COMMS_AGENT_SYSTEM, tool_input["event_summary"])
-    return f"Unknown tool: {name}", {"input_tokens": 0, "output_tokens": 0, "model": CHEAP_MODEL}
+        return call_model(
+            client, CHEAP_MODEL, COMMS_AGENT_SYSTEM, require("event_summary"), step_label="Communications agent"
+        )
+    raise AgentCallError(f"Planner requested an unknown tool: {name}")
 
 
 # --- Planner (orchestrator) — this is the actual agentic loop -------------------------------
@@ -241,12 +308,8 @@ def run_orchestrator(client: Anthropic, goal: str, volunteer_roster: str, on_ste
     ]
 
     for _ in range(6):  # safety cap so a confused model can't loop forever
-        resp = client.messages.create(
-            model=STRONG_MODEL,
-            max_tokens=1500,
-            system=PLANNER_SYSTEM,
-            tools=TOOLS,
-            messages=messages,
+        resp, truncated = create_message(
+            client, "Planner agent", model=STRONG_MODEL, system=PLANNER_SYSTEM, tools=TOOLS, messages=messages
         )
         usages.append(
             {"input_tokens": resp.usage.input_tokens, "output_tokens": resp.usage.output_tokens, "model": STRONG_MODEL}
@@ -254,6 +317,8 @@ def run_orchestrator(client: Anthropic, goal: str, volunteer_roster: str, on_ste
 
         if resp.stop_reason != "tool_use":
             final_text = "".join(b.text for b in resp.content if b.type == "text")
+            if truncated:
+                final_text += TRUNCATION_WARNING
             return final_text, tool_log, usages
 
         messages.append({"role": "assistant", "content": resp.content})
@@ -275,7 +340,32 @@ def run_orchestrator(client: Anthropic, goal: str, volunteer_roster: str, on_ste
 
 
 def audit_step(client: Anthropic, plan_text: str) -> tuple[str, dict]:
-    return call_model(client, STRONG_MODEL, AUDIT_SYSTEM, plan_text)
+    return call_model(client, STRONG_MODEL, AUDIT_SYSTEM, plan_text, step_label="Audit agent")
+
+
+def escape_markdown_dollars(text: str) -> str:
+    """Streamlit's markdown renders "$...$" as LaTeX math, which mangles agent-generated
+    budget figures like "$3,000 for 300 guests ($10/person)". Escape literal dollar
+    signs before display so they render as plain text instead."""
+    return (text or "").replace("$", r"\$")
+
+
+def is_finished_plan(tool_log: list, final_text: str) -> bool:
+    """True only if the planner actually finished a plan, rather than stopping to ask a
+    clarifying question (e.g. a vague goal, or a full event with no volunteer roster to
+    work with). PLANNER_SYSTEM requires a finished plan to open with an "Overview"
+    section, so its absence — combined with the text trailing off into a question, the
+    way a request for more info does — is a reasonably reliable signal the planner isn't
+    done yet. Auditing a clarifying question instead of a plan produces a confusing,
+    useless review, so this errs toward treating ambiguous output as unfinished."""
+    if not tool_log:
+        return False
+    text = (final_text or "").strip()
+    if not text:
+        return False
+    mentions_overview = "overview" in text[:400].lower()
+    ends_like_a_question = text.rstrip("*_>`\" ").endswith("?")
+    return mentions_overview and not ends_like_a_question
 
 
 # --- UI ---------------------------------------------------------------------------------
@@ -307,7 +397,12 @@ goal = st.text_area(
 with st.expander("Volunteer roster (demo data pre-filled — edit it to try your own)"):
     volunteer_roster = st.text_area("Available volunteers", value=DEFAULT_ROSTER, height=130)
 
-if st.button("Generate Operations Plan", type="primary") and goal.strip():
+goal_is_empty = not goal.strip()
+generate_clicked = st.button("Generate Operations Plan", type="primary", disabled=goal_is_empty)
+if goal_is_empty:
+    st.caption("⬆️ Describe what your community needs above to enable this button.")
+
+if generate_clicked and goal.strip():
     client = get_client()
     status_box = st.status("Khidmah AI is working...", expanded=True)
     status_box.write("🧠 Planner Agent — reading the goal and deciding what's actually needed...")
@@ -315,26 +410,39 @@ if st.button("Generate Operations Plan", type="primary") and goal.strip():
     def on_step(tool_name, _tool_input):
         status_box.write(f"→ {STEP_LABELS.get(tool_name, tool_name)}")
 
-    final_plan, tool_log, usages = run_orchestrator(client, goal, volunteer_roster, on_step=on_step)
+    try:
+        final_plan, tool_log, usages = run_orchestrator(client, goal, volunteer_roster, on_step=on_step)
 
-    status_box.write("🔍 Audit Agent — reviewing the finished plan for gaps before it goes live...")
-    audit_result, audit_usage = audit_step(client, final_plan)
-    usages.append(audit_usage)
+        plan_is_finished = is_finished_plan(tool_log, final_plan)
+        audit_result = None
+        if plan_is_finished:
+            status_box.write("🔍 Audit Agent — reviewing the finished plan for gaps before it goes live...")
+            audit_result, audit_usage = audit_step(client, final_plan)
+            usages.append(audit_usage)
+    except AgentCallError as exc:
+        status_box.update(label="Failed", state="error")
+        st.error(f"⚠️ {exc}")
+        st.stop()
 
     status_box.update(label=f"Done — {len(tool_log)} specialist agent(s) called", state="complete")
 
     st.divider()
-    st.subheader("📋 Operations Plan")
-    st.markdown(final_plan)
 
-    st.subheader("⚠️ Needs Attention")
-    st.markdown(audit_result)
+    if not plan_is_finished:
+        st.subheader("💬 Khidmah AI needs more information")
+        st.markdown(escape_markdown_dollars(final_plan))
+    else:
+        st.subheader("📋 Operations Plan")
+        st.markdown(escape_markdown_dollars(final_plan))
+
+        st.subheader("⚠️ Needs Attention")
+        st.markdown(escape_markdown_dollars(audit_result))
 
     if tool_log:
         with st.expander("See each specialist agent's raw output (the reasoning trail)"):
             for name, _inp, result in tool_log:
                 st.markdown(f"**{STEP_LABELS.get(name, name)}**")
-                st.write(result)
+                st.markdown(escape_markdown_dollars(result))
                 st.divider()
     else:
         st.info("The planner decided no specialist agents were needed for this goal — it answered directly.")
