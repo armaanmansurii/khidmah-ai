@@ -44,6 +44,20 @@ cp .env.example .env   # paste your real ANTHROPIC_API_KEY into .env (same key a
 streamlit run app.py
 ```
 
+## Email notifications (Gmail SMTP)
+
+Subscribers sign up with an email address in the app (📧 Email subscribers section), and once
+a plan is generated, an admin can review the drafted email message and click "Confirm & Send"
+to notify them — nothing sends automatically.
+
+To wire this up:
+1. Add `GMAIL_ADDRESS` and `GMAIL_APP_PASSWORD` to `.env` (see `.env.example`).
+2. `GMAIL_APP_PASSWORD` is a Gmail **App Password** — a 16-character code that lets this app
+   send mail through your Gmail account without using your real password. Generate one at
+   [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords). This
+   requires **2-Step Verification** to already be enabled on the Google account — if it isn't,
+   Google will prompt you to turn it on first.
+
 ## Deploying (required — judges need a real URL, not localhost)
 
 1. Push this repo to GitHub (public).

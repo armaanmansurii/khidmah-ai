@@ -36,10 +36,13 @@ Deploy: push this repo to GitHub (public), then on share.streamlit.io point at i
 Set ANTHROPIC_API_KEY in that app's Settings -> Secrets instead of committing .env.
 """
 
+import json
 import os
 import re
+import smtplib
 import uuid
 from datetime import date, datetime, timedelta, time as dt_time, timezone
+from email.mime.text import MIMEText
 
 import streamlit as st
 import anthropic
@@ -150,6 +153,120 @@ def estimate_cost(usages: list[dict]) -> float:
         total += (u["input_tokens"] / 1_000_000) * p["input"]
         total += (u["output_tokens"] / 1_000_000) * p["output"]
     return total
+
+
+# --- Subscriber list & email notifications ----------------------------------------------
+
+SUBSCRIBERS_FILE = "subscribers.json"
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def load_subscribers() -> list[dict]:
+    if not os.path.exists(SUBSCRIBERS_FILE):
+        return []
+    try:
+        with open(SUBSCRIBERS_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_subscribers(subscribers: list[dict]) -> None:
+    with open(SUBSCRIBERS_FILE, "w") as f:
+        json.dump(subscribers, f, indent=2)
+
+
+def normalize_email(raw: str) -> str | None:
+    """Best-effort normalize an email address (trim + lowercase). Returns None if the
+    result doesn't look like a valid address, rather than guessing further."""
+    cleaned = (raw or "").strip().lower()
+    return cleaned if EMAIL_RE.match(cleaned) else None
+
+
+COMMS_SECTION_LABELS = ["WHATSAPP", "EMAIL", "INSTAGRAM CAPTION", "VOLUNTEER THANK-YOU MESSAGE"]
+
+
+_COMMS_HEADING_RE = re.compile(r"^[ \t]*#{0,6}[ \t]*\**\s*([A-Za-z][A-Za-z\- ]*?)\**[ \t]*:?[ \t]*$")
+_SEPARATOR_LINE_RE = re.compile(r"[-_*]{3,}")
+
+
+def extract_comms_section(comms_output: str, label: str) -> str | None:
+    """Pull just one labeled section (e.g. "WHATSAPP") out of run_comms_agent's raw output,
+    so the WhatsApp send flow can default to only the WhatsApp draft rather than the whole
+    multi-channel comms block. COMMS_AGENT_SYSTEM asks for "clearly labeled" sections but
+    doesn't pin an exact format, and in practice the model renders labels as markdown
+    headings (e.g. "# WHATSAPP") with "---" rules between sections — so this matches each
+    heading line by itself rather than assuming a fixed prefix/suffix around the label."""
+    lines = (comms_output or "").splitlines()
+    headings = []
+    for i, line in enumerate(lines):
+        match = _COMMS_HEADING_RE.match(line)
+        if match and match.group(1).strip().upper() in COMMS_SECTION_LABELS:
+            headings.append((i, match.group(1).strip().upper()))
+
+    target = label.upper()
+    for pos, (line_idx, found_label) in enumerate(headings):
+        if found_label != target:
+            continue
+        start = line_idx + 1
+        end = headings[pos + 1][0] if pos + 1 < len(headings) else len(lines)
+        body = lines[start:end]
+        while body and (not body[0].strip() or _SEPARATOR_LINE_RE.fullmatch(body[0].strip())):
+            body.pop(0)
+        while body and (not body[-1].strip() or _SEPARATOR_LINE_RE.fullmatch(body[-1].strip())):
+            body.pop()
+        section = "\n".join(body).strip()
+        return section or None
+    return None
+
+
+EMAIL_SUBJECT = "Khidmah AI — Community Announcement"
+
+
+def send_email_to_subscribers(body: str, subscribers: list[dict]) -> tuple[list[dict], str | None]:
+    """Send `body` via Gmail SMTP to every subscriber's email address. Returns
+    (per_recipient_results, setup_error). setup_error is set (with results left empty) when
+    GMAIL_* env vars are missing, before any send is attempted. Otherwise each subscriber
+    gets its own try/except so one bad address can't stop the rest of the batch from sending."""
+    gmail_address = os.environ.get("GMAIL_ADDRESS")
+    gmail_app_password = os.environ.get("GMAIL_APP_PASSWORD")
+    missing = [
+        name
+        for name, value in [("GMAIL_ADDRESS", gmail_address), ("GMAIL_APP_PASSWORD", gmail_app_password)]
+        if not value
+    ]
+    if missing:
+        return [], f"Missing {', '.join(missing)} in .env — can't send emails."
+
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=30)
+    except Exception as exc:
+        return [], f"Couldn't connect to smtp.gmail.com: {type(exc).__name__}: {exc}"
+
+    try:
+        server.starttls()
+        server.login(gmail_address, gmail_app_password)
+    except Exception as exc:
+        server.quit()
+        return [], f"Gmail login failed — check GMAIL_ADDRESS/GMAIL_APP_PASSWORD: {type(exc).__name__}: {exc}"
+
+    results = []
+    try:
+        for sub in subscribers:
+            email = sub.get("email", "")
+            try:
+                msg = MIMEText(body)
+                msg["Subject"] = EMAIL_SUBJECT
+                msg["From"] = gmail_address
+                msg["To"] = email
+                server.sendmail(gmail_address, [email], msg.as_string())
+                results.append({"email": email, "ok": True, "error": None})
+            except Exception as exc:
+                results.append({"email": email, "ok": False, "error": f"{type(exc).__name__}: {exc}"})
+    finally:
+        server.quit()
+    return results, None
 
 
 # --- Specialist agents (called as tools by the planner) --------------------------------
@@ -610,6 +727,34 @@ with st.expander("Volunteer roster (demo data pre-filled — edit it to try your
         "Available volunteers", value=DEFAULT_ROSTER, height=130, disabled=recruitment_mode
     )
 
+subscribers = load_subscribers()
+with st.expander(f"📧 Email subscribers ({len(subscribers)}) — sign up demo email addresses"):
+    if subscribers:
+        for i, sub in enumerate(subscribers):
+            col1, col2 = st.columns([4, 1])
+            col1.write(sub["email"])
+            if col2.button("Remove", key=f"remove_sub_{i}"):
+                subscribers.pop(i)
+                save_subscribers(subscribers)
+                st.rerun()
+    else:
+        st.caption("No subscribers yet.")
+
+    with st.form("subscribe_form", clear_on_submit=True):
+        new_email = st.text_input("Email address (e.g. name@example.com)")
+        subscribed_clicked = st.form_submit_button("Subscribe")
+    if subscribed_clicked:
+        normalized = normalize_email(new_email)
+        if not normalized:
+            st.error("That doesn't look like a valid email address.")
+        elif any(s["email"] == normalized for s in subscribers):
+            st.info(f"{normalized} is already subscribed.")
+        else:
+            subscribers.append({"email": normalized})
+            save_subscribers(subscribers)
+            st.success(f"Subscribed {normalized}.")
+            st.rerun()
+
 goal_is_empty = not goal.strip()
 generate_clicked = st.button("Generate Operations Plan", type="primary", disabled=goal_is_empty)
 if goal_is_empty:
@@ -641,6 +786,25 @@ if generate_clicked and goal.strip():
 
     status_box.update(label=f"Done — {len(tool_log)} specialist agent(s) called", state="complete")
 
+    # Stashed in session_state (rather than just rendered inline) so the plan/audit/download
+    # section survives the reruns Streamlit does on every later button click on this page —
+    # e.g. clicking "Confirm & Send via WhatsApp" below, which needs the plan still on screen.
+    st.session_state["last_run"] = {
+        "final_plan": final_plan,
+        "tool_log": tool_log,
+        "usages": usages,
+        "plan_is_finished": plan_is_finished,
+        "audit_result": audit_result,
+    }
+
+if st.session_state.get("last_run"):
+    run = st.session_state["last_run"]
+    final_plan = run["final_plan"]
+    tool_log = run["tool_log"]
+    usages = run["usages"]
+    plan_is_finished = run["plan_is_finished"]
+    audit_result = run["audit_result"]
+
     st.divider()
 
     if not plan_is_finished:
@@ -665,6 +829,40 @@ if generate_clicked and goal.strip():
             st.caption(
                 "Google Calendar: Settings (gear icon) → Import & export → Import, then select this file."
             )
+
+        st.subheader("📧 Notify Subscribers via Email")
+        current_subscribers = load_subscribers()
+        comms_output = next((result for name, _inp, result in tool_log if name == "run_comms_agent"), None)
+        email_draft = extract_comms_section(comms_output, "EMAIL") if comms_output else None
+        if not current_subscribers:
+            st.caption("No subscribers yet — add email addresses in the sign-up section above to enable this.")
+        elif not email_draft:
+            st.caption("No email draft was generated for this plan, so there's nothing to send.")
+        else:
+            message_to_send = st.text_area(
+                f"Email message — will be sent to {len(current_subscribers)} subscriber(s)",
+                value=email_draft,
+                height=120,
+                key="email_message_draft",
+            )
+            st.caption(
+                "Nothing is sent until you click below — generating a plan never sends messages "
+                "automatically."
+            )
+            if st.button("📧 Confirm & Send", key="send_email_btn"):
+                with st.spinner(f"Sending to {len(current_subscribers)} subscriber(s)..."):
+                    send_results, setup_error = send_email_to_subscribers(message_to_send, current_subscribers)
+                if setup_error:
+                    st.error(f"⚠️ {setup_error}")
+                else:
+                    succeeded = [r for r in send_results if r["ok"]]
+                    failed = [r for r in send_results if not r["ok"]]
+                    if succeeded:
+                        st.success(f"Sent to {len(succeeded)} of {len(send_results)} subscriber(s).")
+                    if failed:
+                        st.warning(f"{len(failed)} of {len(send_results)} failed to send:")
+                        for r in failed:
+                            st.caption(f"- {r['email']}: {r['error']}")
 
     if tool_log:
         with st.expander("See each specialist agent's raw output (the reasoning trail)"):
