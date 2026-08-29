@@ -37,6 +37,10 @@ Set ANTHROPIC_API_KEY in that app's Settings -> Secrets instead of committing .e
 """
 
 import os
+import re
+import uuid
+from datetime import date, datetime, timedelta, time as dt_time, timezone
+
 import streamlit as st
 import anthropic
 from anthropic import Anthropic
@@ -150,13 +154,54 @@ def estimate_cost(usages: list[dict]) -> float:
 
 # --- Specialist agents (called as tools by the planner) --------------------------------
 
-EVENT_AGENT_SYSTEM = """You are the logistics specialist for a mosque's operations team. Given \
-an event goal, produce: a schedule/timeline, a task checklist (a bullet list, including things \
-people forget: setup, cleanup, first aid, prayer/salah scheduling around the event, \
-accessibility), a budget breakdown that fits any stated budget, and a supplies list. Be \
-concrete and mosque-specific — assume volunteer labor, not paid staff, unless told otherwise. \
-End with a short line listing the distinct ROLES that will need volunteers, so another agent \
-can staff them."""
+# The 5 prep-timeline phases the event agent's checklist must be organized under, and how many
+# days before the event each one lands — drives the .ics export (see build_prep_timeline_ics).
+EVENT_PHASES = [
+    ("4 Weeks Before", 28),
+    ("3 Weeks Before", 21),
+    ("2 Weeks Before", 14),
+    ("1 Week Before", 7),
+    ("Day-Of Timeline", 0),
+]
+
+
+def build_event_agent_system(today: date) -> str:
+    """EVENT_AGENT_SYSTEM is date-aware (built fresh per request) because it must resolve
+    relative dates ("next Friday") against the actual current date, and its output is
+    parsed by parse_event_timeline() to build a downloadable prep-timeline calendar — so
+    the format contract here (EVENT_DATE/EVENT_TIME/EVENT_TITLE lines, exact phase
+    headings) is load-bearing, not just stylistic."""
+    return f"""You are the logistics specialist for a mosque's operations team. Today's date \
+is {today.isoformat()} ({today.strftime("%A, %B %d, %Y")}).
+
+First, resolve the event goal's date/time to an absolute calendar date using today's date \
+(e.g. "next Friday" or "this Saturday at 6pm" both resolve to a specific date). If the event \
+goal does not mention any date, day, or timeframe at all, respond with EXACTLY the single line \
+NEEDS_DATE and nothing else — do not guess a date.
+
+Otherwise, your response MUST begin with these lines, in this exact order, before anything \
+else (no preamble):
+EVENT_DATE: YYYY-MM-DD
+EVENT_TIME: HH:MM
+EVENT_TITLE: <short event name, 3-6 words>
+(Omit the EVENT_TIME line entirely if no time was given or clearly implied.)
+
+Then produce a task checklist organized under EXACTLY these five section headings, each on \
+its own line starting with "## ", in this exact order, with every task as a bullet point \
+under whichever phase it actually needs to happen in (setup, cleanup, first aid, \
+prayer/salah scheduling, accessibility, and anything else people forget):
+## 4 Weeks Before
+## 3 Weeks Before
+## 2 Weeks Before
+## 1 Week Before
+## Day-Of Timeline
+If a phase genuinely has nothing to do, still include its heading with a single bullet \
+"- Nothing specific this phase." — all five headings must always be present.
+
+After Day-Of Timeline, add a same-day schedule/timeline, a budget breakdown that fits any \
+stated budget, and a supplies list. Be concrete and mosque-specific — assume volunteer labor, \
+not paid staff, unless told otherwise. End with a short line listing the distinct ROLES that \
+will need volunteers, so another agent can staff them."""
 
 VOLUNTEER_AGENT_SYSTEM = """You are the volunteer coordination specialist. Given a list of \
 roles/shifts needed and a roster of available volunteers with their availability and skills, \
@@ -257,7 +302,7 @@ STEP_LABELS = {
 }
 
 
-def execute_tool(client: Anthropic, name: str, tool_input: dict) -> tuple[str, dict]:
+def execute_tool(client: Anthropic, name: str, tool_input: dict, today: date) -> tuple[str, dict]:
     def require(field: str) -> str:
         value = tool_input.get(field)
         if value is None:
@@ -266,7 +311,11 @@ def execute_tool(client: Anthropic, name: str, tool_input: dict) -> tuple[str, d
 
     if name == "run_event_agent":
         return call_model(
-            client, CHEAP_MODEL, EVENT_AGENT_SYSTEM, require("event_goal"), step_label="Event/logistics agent"
+            client,
+            CHEAP_MODEL,
+            build_event_agent_system(today),
+            require("event_goal"),
+            step_label="Event/logistics agent",
         )
     if name == "run_volunteer_agent":
         user_msg = (
@@ -306,6 +355,12 @@ the roles/shifts needed, call run_comms_agent with is_recruitment_call=true and 
 event_summary that explicitly lists those specific roles and headcounts, so it drafts a real \
 call for volunteers instead of a generic announcement.
 
+DATE REQUIRED: this app builds a downloadable prep-timeline calendar from run_event_agent's \
+output, which requires a real event date — never guess one yourself. If run_event_agent's \
+result is exactly "NEEDS_DATE", stop calling tools immediately (do not call run_volunteer_agent \
+or run_comms_agent) and ask the admin what date/day the event is, the same way you'd ask about \
+any other missing detail.
+
 Once you have everything the goal requires, STOP calling tools and instead write ONE complete, \
 well-organized final operations plan for the admin, with headings: Overview, Task Checklist, \
 then either Volunteer Assignments (only if you ran the volunteer agent — named volunteers per \
@@ -338,6 +393,7 @@ def run_orchestrator(client: Anthropic, goal: str, volunteer_roster: str, recrui
     Returns (final_plan_text, tool_call_log, usages)."""
     usages: list[dict] = []
     tool_log: list[tuple[str, dict, str]] = []
+    today = date.today()
     if recruitment_mode:
         # Whatever's in the roster textbox is irrelevant here — deliberately not passed to
         # the planner at all, since there's no one to assign yet.
@@ -353,7 +409,7 @@ def run_orchestrator(client: Anthropic, goal: str, volunteer_roster: str, recrui
     messages = [
         {
             "role": "user",
-            "content": f"Community goal: {goal}\n\n{roster_section}",
+            "content": f"Community goal: {goal}\n\nToday's date: {today.isoformat()}\n\n{roster_section}",
         }
     ]
 
@@ -378,7 +434,7 @@ def run_orchestrator(client: Anthropic, goal: str, volunteer_roster: str, recrui
                 continue
             if on_step:
                 on_step(block.name, block.input)
-            result_text, usage = execute_tool(client, block.name, block.input)
+            result_text, usage = execute_tool(client, block.name, block.input, today)
             usages.append(usage)
             tool_log.append((block.name, block.input, result_text))
             tool_results.append(
@@ -416,6 +472,108 @@ def is_finished_plan(tool_log: list, final_text: str) -> bool:
     mentions_overview = "overview" in text[:400].lower()
     ends_like_a_question = text.rstrip("*_>`\" ").endswith("?")
     return mentions_overview and not ends_like_a_question
+
+
+def parse_event_timeline(event_agent_output: str) -> dict | None:
+    """Extract the resolved event date/time/title and the 5 prep phases (with computed
+    dates) from run_event_agent's raw output (see build_event_agent_system for the format
+    contract). Returns None if there's no usable EVENT_DATE line — e.g. the event agent
+    asked for a date instead (NEEDS_DATE) — so callers just skip offering the .ics
+    download rather than guess or build a broken calendar file."""
+    text = event_agent_output or ""
+    date_match = re.search(r"(?m)^EVENT_DATE:\s*(\d{4}-\d{2}-\d{2})\s*$", text)
+    if not date_match:
+        return None
+    try:
+        event_date = date.fromisoformat(date_match.group(1))
+    except ValueError:
+        return None
+
+    time_match = re.search(r"(?m)^EVENT_TIME:\s*(\d{1,2}):(\d{2})\s*$", text)
+    event_time = dt_time(int(time_match.group(1)), int(time_match.group(2))) if time_match else None
+
+    title_match = re.search(r"(?m)^EVENT_TITLE:\s*(.+?)\s*$", text)
+    event_title = title_match.group(1) if title_match else "Event"
+
+    phases = []
+    for label, days_before in EVENT_PHASES:
+        heading = re.search(rf"(?im)^#{{1,3}}[^\n]*\b{re.escape(label)}\b[^\n]*$", text)
+        if not heading:
+            continue
+        start = heading.end()
+        next_heading = re.search(r"(?m)^#{1,3}[^\n]*$", text[start:])
+        end = start + next_heading.start() if next_heading else len(text)
+        body = text[start:end].strip()
+        if body:
+            phases.append({"label": label, "date": event_date - timedelta(days=days_before), "items": body})
+
+    if not phases:
+        return None
+    return {"event_date": event_date, "event_time": event_time, "event_title": event_title, "phases": phases}
+
+
+def _ics_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+
+def _ics_fold(line: str) -> str:
+    """RFC 5545: content lines SHOULD be folded at 75 octets; continuation lines start
+    with a single space. A simple character-based fold (not exact octet-counting) is fine
+    for the mostly-ASCII text this app generates."""
+    limit = 74
+    if len(line) <= limit:
+        return line
+    chunks = [line[:limit]]
+    rest = line[limit:]
+    while rest:
+        chunks.append(" " + rest[: limit - 1])
+        rest = rest[limit - 1 :]
+    return "\r\n".join(chunks)
+
+
+def build_prep_timeline_ics(timeline: dict) -> bytes:
+    """Build an RFC 5545 .ics calendar: one all-day VEVENT per prep phase on its computed
+    date, plus one VEVENT for the event itself (timed if EVENT_TIME was given, else
+    all-day)."""
+    dtstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Khidmah AI//Prep Timeline//EN", "CALSCALE:GREGORIAN"]
+
+    def add_vevent(uid_suffix: str, summary: str, description: str, start_date: date, start_time: dt_time | None):
+        lines.append("BEGIN:VEVENT")
+        lines.append(_ics_fold(f"UID:{uuid.uuid4()}-{uid_suffix}@khidmah.ai"))
+        lines.append(f"DTSTAMP:{dtstamp}")
+        if start_time is None:
+            lines.append(f"DTSTART;VALUE=DATE:{start_date.strftime('%Y%m%d')}")
+            lines.append(f"DTEND;VALUE=DATE:{(start_date + timedelta(days=1)).strftime('%Y%m%d')}")
+        else:
+            start_dt = datetime.combine(start_date, start_time)
+            end_dt = start_dt + timedelta(hours=3)  # reasonable default event duration
+            lines.append(f"DTSTART:{start_dt.strftime('%Y%m%dT%H%M%S')}")
+            lines.append(f"DTEND:{end_dt.strftime('%Y%m%dT%H%M%S')}")
+        lines.append(_ics_fold(f"SUMMARY:{_ics_escape(summary)}"))
+        lines.append(_ics_fold(f"DESCRIPTION:{_ics_escape(description)}"))
+        lines.append("END:VEVENT")
+
+    event_title = timeline["event_title"]
+    for phase in timeline["phases"]:
+        add_vevent(
+            uid_suffix=phase["label"].lower().replace(" ", "-"),
+            summary=f"{event_title} Prep: {phase['label']}",
+            description=phase["items"],
+            start_date=phase["date"],
+            start_time=None,  # prep reminders are all-day
+        )
+
+    add_vevent(
+        uid_suffix="event",
+        summary=event_title,
+        description="The event itself.",
+        start_date=timeline["event_date"],
+        start_time=timeline["event_time"],
+    )
+
+    lines.append("END:VCALENDAR")
+    return ("\r\n".join(lines) + "\r\n").encode("utf-8")
 
 
 # --- UI ---------------------------------------------------------------------------------
@@ -494,6 +652,19 @@ if generate_clicked and goal.strip():
 
         st.subheader("⚠️ Needs Attention")
         st.markdown(escape_markdown_dollars(audit_result))
+
+        event_agent_output = next((result for name, _inp, result in tool_log if name == "run_event_agent"), None)
+        timeline = parse_event_timeline(event_agent_output) if event_agent_output else None
+        if timeline:
+            st.download_button(
+                "📅 Download prep timeline (.ics) — import into Google Calendar or any calendar app",
+                data=build_prep_timeline_ics(timeline),
+                file_name="khidmah_prep_timeline.ics",
+                mime="text/calendar",
+            )
+            st.caption(
+                "Google Calendar: Settings (gear icon) → Import & export → Import, then select this file."
+            )
 
     if tool_log:
         with st.expander("See each specialist agent's raw output (the reasoning trail)"):
