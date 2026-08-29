@@ -169,6 +169,16 @@ summary, produce four short pieces, clearly labeled: WHATSAPP (casual, brief, wi
 greeting), EMAIL (slightly more formal, with a subject line), INSTAGRAM CAPTION (short, with \
 2-4 relevant hashtags), VOLUNTEER THANK-YOU MESSAGE (warm, brief). Keep each under 80 words."""
 
+RECRUITMENT_COMMS_SYSTEM = """You draft a "Call for Volunteers" recruitment announcement for a \
+mosque event that has NO confirmed volunteers yet — do not draft a thank-you message, there is \
+no one to thank. Given a summary of the event and the specific roles/shifts still needed \
+(with headcounts), produce three short pieces, clearly labeled: WHATSAPP (casual, brief, with \
+an Islamic greeting), EMAIL (slightly more formal, with a subject line), INSTAGRAM CAPTION \
+(short, with 2-4 relevant hashtags). Each piece must name the actual roles/shifts and \
+headcounts needed (e.g. "2 volunteers for setup, Friday 2-4pm") — never a vague "we need \
+help" — and tell people how to sign up (reply to this message/email). Never invent roles that \
+weren't given to you. Keep each under 80 words."""
+
 TOOLS = [
     {
         "name": "run_event_agent",
@@ -223,7 +233,17 @@ TOOLS = [
                 "event_summary": {
                     "type": "string",
                     "description": "A summary of the event/program to communicate about",
-                }
+                },
+                "is_recruitment_call": {
+                    "type": "boolean",
+                    "description": (
+                        "Set to true only in recruitment mode (no volunteers confirmed yet). "
+                        "This drafts a 'Call for Volunteers' announcement asking people to sign "
+                        "up for specific roles, instead of a normal event announcement — the "
+                        "event_summary should then explicitly list the roles/headcounts still "
+                        "needed (from run_event_agent's checklist), not just describe the event."
+                    ),
+                },
             },
             "required": ["event_summary"],
         },
@@ -255,9 +275,9 @@ def execute_tool(client: Anthropic, name: str, tool_input: dict) -> tuple[str, d
         )
         return call_model(client, CHEAP_MODEL, VOLUNTEER_AGENT_SYSTEM, user_msg, step_label="Volunteer coordinator agent")
     if name == "run_comms_agent":
-        return call_model(
-            client, CHEAP_MODEL, COMMS_AGENT_SYSTEM, require("event_summary"), step_label="Communications agent"
-        )
+        is_recruitment_call = bool(tool_input.get("is_recruitment_call", False))
+        system = RECRUITMENT_COMMS_SYSTEM if is_recruitment_call else COMMS_AGENT_SYSTEM
+        return call_model(client, CHEAP_MODEL, system, require("event_summary"), step_label="Communications agent")
     raise AgentCallError(f"Planner requested an unknown tool: {name}")
 
 
@@ -270,7 +290,8 @@ community needs — an event, a program, an announcement, a volunteer effort.
 You have three specialist agents available as tools:
 - run_event_agent: logistics, scheduling, checklists, budget, supplies
 - run_volunteer_agent: assigns people to roles/shifts (needs a task list AND the volunteer roster)
-- run_comms_agent: drafts announcements/messages once the event/program is defined
+- run_comms_agent: drafts announcements/messages once the event/program is defined; set \
+is_recruitment_call=true instead of a normal announcement when there are no volunteers yet
 
 Decide for yourself which of these THIS SPECIFIC goal actually needs — not every goal needs \
 all three. A pure announcement about something already planned might only need \
@@ -279,31 +300,60 @@ exist), then run_volunteer_agent (using those roles + the roster you were given)
 run_comms_agent last (once the event is fully defined). Call one tool at a time and use each \
 result to inform the next call's input.
 
+RECRUITMENT MODE: if the admin's message says no volunteers are confirmed yet, do NOT call \
+run_volunteer_agent — there is no one to assign. Instead, once run_event_agent has identified \
+the roles/shifts needed, call run_comms_agent with is_recruitment_call=true and an \
+event_summary that explicitly lists those specific roles and headcounts, so it drafts a real \
+call for volunteers instead of a generic announcement.
+
 Once you have everything the goal requires, STOP calling tools and instead write ONE complete, \
 well-organized final operations plan for the admin, with headings: Overview, Task Checklist, \
-Volunteer Assignments (only if you ran the volunteer agent), Communications Drafts (only if you \
-ran the comms agent). Never invent volunteer names that weren't in the roster you were given."""
+then either Volunteer Assignments (only if you ran the volunteer agent — named volunteers per \
+role) or Volunteers Needed (recruitment mode — the roles/headcounts still needed, no names), \
+then Communications Drafts (only if you ran the comms agent). Never invent volunteer names \
+that weren't in the roster you were given."""
 
 AUDIT_SYSTEM = """You are the audit/review agent for a mosque operations plan. Given a \
-complete plan (checklist, volunteer assignments, communications), review it critically for \
-gaps commonly missed by volunteer-run mosques: conflicts with prayer/salah times, \
-accessibility needs, parental consent for youth-focused events, insufficient cleanup crew, a \
-budget that doesn't add up or is unrealistic for the stated amount, food-safety/allergy notes, \
-and any role mentioned in the checklist that was never actually assigned a volunteer. Output a \
-short bullet list of flags (⚠ each one), or state clearly "✅ No major gaps found" if there \
-truly are none — don't invent issues to seem thorough. End with exactly one line: \
+complete plan (checklist, either volunteer assignments or a volunteers-needed list, and \
+communications), review it critically for gaps commonly missed by volunteer-run mosques: \
+conflicts with prayer/salah times, accessibility needs, parental consent for youth-focused \
+events, insufficient cleanup crew, a budget that doesn't add up or is unrealistic for the \
+stated amount, food-safety/allergy notes, and any role mentioned in the checklist that was \
+never actually assigned a volunteer.
+
+If the plan has a "Volunteers Needed" section instead of "Volunteer Assignments", that means \
+recruitment mode was deliberately chosen — there are no volunteers yet by design, so do NOT \
+flag unassigned or unnamed roles as a defect. Instead check that the Communications Drafts are \
+an actual call for volunteers (not a generic announcement) and that every role/headcount from \
+the Task Checklist is named somewhere in that call — flag any checklist role the recruitment \
+call fails to mention.
+
+Output a short bullet list of flags (⚠ each one), or state clearly "✅ No major gaps found" if \
+there truly are none — don't invent issues to seem thorough. End with exactly one line: \
 "READY TO PUBLISH: Yes" or "READY TO PUBLISH: Needs attention"."""
 
 
-def run_orchestrator(client: Anthropic, goal: str, volunteer_roster: str, on_step=None):
+def run_orchestrator(client: Anthropic, goal: str, volunteer_roster: str, recruitment_mode: bool = False, on_step=None):
     """The planner decides which specialist agents to call, in what order, via real tool-use.
     Returns (final_plan_text, tool_call_log, usages)."""
     usages: list[dict] = []
     tool_log: list[tuple[str, dict, str]] = []
+    if recruitment_mode:
+        # Whatever's in the roster textbox is irrelevant here — deliberately not passed to
+        # the planner at all, since there's no one to assign yet.
+        roster_section = (
+            "RECRUITMENT MODE — no volunteers are confirmed yet. Do NOT call "
+            "run_volunteer_agent (there is no one to assign). Once run_event_agent has "
+            "identified the roles/shifts needed, call run_comms_agent with "
+            "is_recruitment_call=true and list those specific roles and headcounts so it can "
+            "draft a real call for volunteers."
+        )
+    else:
+        roster_section = f"Available volunteers:\n{volunteer_roster}"
     messages = [
         {
             "role": "user",
-            "content": f"Community goal: {goal}\n\nAvailable volunteers:\n{volunteer_roster}",
+            "content": f"Community goal: {goal}\n\n{roster_section}",
         }
     ]
 
@@ -395,7 +445,12 @@ goal = st.text_area(
 )
 
 with st.expander("Volunteer roster (demo data pre-filled — edit it to try your own)"):
-    volunteer_roster = st.text_area("Available volunteers", value=DEFAULT_ROSTER, height=130)
+    recruitment_mode = st.checkbox(
+        "We don't have volunteers yet — generate a recruitment call instead of assignments."
+    )
+    volunteer_roster = st.text_area(
+        "Available volunteers", value=DEFAULT_ROSTER, height=130, disabled=recruitment_mode
+    )
 
 goal_is_empty = not goal.strip()
 generate_clicked = st.button("Generate Operations Plan", type="primary", disabled=goal_is_empty)
@@ -411,7 +466,9 @@ if generate_clicked and goal.strip():
         status_box.write(f"→ {STEP_LABELS.get(tool_name, tool_name)}")
 
     try:
-        final_plan, tool_log, usages = run_orchestrator(client, goal, volunteer_roster, on_step=on_step)
+        final_plan, tool_log, usages = run_orchestrator(
+            client, goal, volunteer_roster, recruitment_mode=recruitment_mode, on_step=on_step
+        )
 
         plan_is_finished = is_finished_plan(tool_log, final_plan)
         audit_result = None
