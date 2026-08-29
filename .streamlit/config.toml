@@ -1,0 +1,9 @@
+[theme]
+primaryColor = "#B5502C"
+backgroundColor = "#FBF6EE"
+secondaryBackgroundColor = "#F0E6D6"
+textColor = "#2E2418"
+font = "sans serif"
+borderColor = "#E4D7C2"
+baseRadius = "medium"
+showWidgetBorder = true
